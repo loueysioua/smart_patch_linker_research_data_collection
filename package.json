@@ -1,0 +1,30 @@
+{
+  "name": "data_collection",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "collect": "ts-node src/index.ts",
+    "collect:metadata": "ts-node src/index.ts --mode metadata",
+    "collect:patchsets": "ts-node src/index.ts --mode patchsets",
+    "collect:diffs": "ts-node src/index.ts --mode diffs",
+    "collect:comments": "ts-node src/index.ts --mode comments",
+    "collect:links": "ts-node src/index.ts --mode identify-links",
+    "collect:all": "ts-node src/index.ts --mode all",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@gerritcodereview/typescript-api": "^3.14.0",
+    "@types/node-fetch": "^2.6.13",
+    "node-fetch": "^2.7.0"
+  }
+}

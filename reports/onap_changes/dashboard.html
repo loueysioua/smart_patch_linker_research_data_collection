@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>onap_changes — linkage &amp; change dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161922; --panel-2: #1d212c; --border: #2a2f3d;
+    --text: #e7e9ee; --text-dim: #8b93a7; --accent: #5eb1ff; --accent-2: #ffb454;
+    --good: #63d29b; --warn: #f2c14e; --bad: #ef6f6f; --mono: 'SFMono-Regular', Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; margin:0; }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--border); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  header .sub { color: var(--text-dim); font-size: 12.5px; }
+  .stats { display:flex; gap:10px; padding: 14px 28px; flex-wrap: wrap; }
+  .stat { background: var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 14px; min-width:120px; }
+  .stat b { display:block; font-size: 19px; font-family: var(--mono); }
+  .stat span { color: var(--text-dim); font-size: 11.5px; text-transform: uppercase; letter-spacing:.4px; }
+  .tabs { display:flex; gap:4px; padding: 0 28px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 10px 16px; cursor:pointer; color: var(--text-dim); border-bottom: 2px solid transparent; font-size:13px; }
+  .tab.active { color: var(--text); border-color: var(--accent); }
+  .panel { padding: 16px 28px 40px; }
+  .panel.hidden { display:none; }
+  .toolbar { display:flex; gap:10px; margin-bottom:10px; flex-wrap:wrap; align-items:center; }
+  .toolbar .count { color: var(--text-dim); font-size: 12px; }
+  .toolbar button.clear { background: transparent; border:1px solid var(--border); color: var(--text-dim); padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px; }
+  .toolbar button.clear:hover { color: var(--text); border-color: var(--accent); }
+  input[type=text] { background: var(--panel); border:1px solid var(--border); color: var(--text); padding:6px 8px; border-radius:5px; font-size:12px; width: 100%; }
+  select { background: var(--panel); border:1px solid var(--border); color: var(--text); padding:6px 6px; border-radius:5px; font-size:12px; width: 100%; }
+  table { width:100%; border-collapse: collapse; font-size: 12.8px; table-layout: fixed; }
+  thead th { position: sticky; top:0; background: var(--panel-2); text-align:left; padding:8px 8px 4px; cursor:pointer; border-bottom:1px solid var(--border); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; z-index:2; }
+  thead th:hover { color: var(--accent); }
+  thead th.sorted { color: var(--accent-2); }
+  thead tr.filters th { position: sticky; top: 30px; background: var(--panel-2); cursor: default; padding: 4px 8px 8px; z-index:1; }
+  tbody td { padding:7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+  tbody tr:hover { background: var(--panel); }
+  .mono { font-family: var(--mono); }
+  .pill { padding: 1px 7px; border-radius: 999px; font-size: 11px; border:1px solid var(--border); white-space:nowrap; }
+  .pill.high, .pill.MERGED { color: var(--good); border-color: var(--good); }
+  .pill.medium, .pill.NEW { color: var(--warn); border-color: var(--warn); }
+  .pill.low, .pill.ABANDONED { color: var(--bad); border-color: var(--bad); }
+  .ctx { color: var(--text-dim); }
+  .ctx-full { display: block; margin-top: 6px; padding: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; white-space: pre-wrap; color: var(--text); }
+  .hidden { display: none !important; }
+  a.expand { font-size: 11px; white-space: nowrap; }
+  .pager { display:flex; gap:8px; align-items:center; margin-top:12px; color: var(--text-dim); }
+  .pager button { background: var(--panel); border:1px solid var(--border); color: var(--text); padding:6px 10px; border-radius:6px; cursor:pointer; }
+  .pager button:disabled { opacity:.4; cursor:default; }
+  a { color: var(--accent); text-decoration:none; }
+  .note { color: var(--text-dim); font-size:12px; margin-bottom: 14px; }
+  .table-wrap { max-height: 70vh; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>onap_changes</h1>
+  <div class="sub">linkage &amp; change dashboard — generated from the full dataset, no rows omitted. Every column has its own filter below its header.</div>
+</header>
+<div class="stats" id="stats"></div>
+<div class="tabs">
+  <div class="tab active" data-tab="linkages">Linkages (5605)</div>
+  <div class="tab" data-tab="changes">Changes (100361)</div>
+</div>
+
+<div class="panel" id="panel-linkages">
+  <div class="note">Every detected linkage. Click a header to sort; use the row of boxes right under the headers to filter each field independently (dropdowns for fields with a small set of values, text boxes for free-form ones like the raw match or context).</div>
+  <div class="toolbar"><button class="clear" id="lk-clear">Clear all filters</button><span class="count" id="lk-count"></span></div>
+  <div class="table-wrap"><table id="lk-table"></table></div>
+  <div class="pager" id="lk-pager"></div>
+</div>
+
+<div class="panel hidden" id="panel-changes">
+  <div class="note">Every change. Click a header to sort; use the row of boxes right under the headers to filter each field independently.</div>
+  <div class="toolbar"><button class="clear" id="ch-clear">Clear all filters</button><span class="count" id="ch-count"></span></div>
+  <div class="table-wrap"><table id="ch-table"></table></div>
+  <div class="pager" id="ch-pager"></div>
+</div>
+
+<script>
+const PAGE_SIZE = 100;
+const MAX_SELECT_OPTIONS = 60; // fields with more distinct values than this fall back to a text filter
+
+function esc(s) { return (s===null||s===undefined) ? '' : String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function pill(v) { return (v===null||v===undefined||v==='') ? '' : `<span class="pill ${v}">${esc(v)}</span>`; }
+function yesno(v) { return v ? 'yes' : 'no'; }
+
+// hash -> full (untruncated) linkage context, loaded from contexts.json.
+// Populated once at load time; the Context column looks values up in here
+// so the full text can be revealed in place without re-fetching anything.
+let CONTEXTS = {};
+function toggleContext(rid) {
+  const short = document.getElementById(rid + '-short');
+  const full = document.getElementById(rid + '-full');
+  if (!short || !full) return;
+  short.classList.toggle('hidden');
+  full.classList.toggle('hidden');
+}
+
+// ── column definitions ──────────────────────────────────────────────────────
+// type 'auto'  -> dropdown if the data has few distinct values, else free text
+// type 'text'  -> always a free-text substring filter
+// valueOf(row) -> value used for filtering/sorting/the dropdown options
+// html(row)    -> what's rendered in the cell (defaults to esc(valueOf(row)))
+
+const LK_COLUMNS = [
+  {key:'source_number', label:'Source #', type:'auto', valueOf:r=>r.source_number, width:'80px',
+    html:r=>`<a href="#" class="mono" onclick="jumpToChange(${r.source_number});return false;">#${r.source_number}</a>`},
+  {key:'target_number', label:'Target #', type:'auto', valueOf:r=>r.target_number, width:'80px',
+    html:r=>r.target_number ? `<span class="mono">#${r.target_number}</span>` : ''},
+  {key:'target_status', label:'Target status', type:'auto', valueOf:r=>r.target_status||'', html:r=>pill(r.target_status), width:'90px'},
+  {key:'detection_method', label:'Method', type:'auto', valueOf:r=>r.detection_method||'', width:'90px'},
+  {key:'confidence', label:'Confidence', type:'auto', valueOf:r=>r.confidence||'', html:r=>pill(r.confidence), width:'90px'},
+  {key:'source_fields', label:'Found in field(s)', type:'multi', valueOf:r=>r.source_fields||'', width:'130px',
+    splitValue:r=>(r.source_fields ? r.source_fields.split(', ').filter(Boolean) : [])},
+  {key:'host', label:'Host', type:'auto', valueOf:r=>r.host||'', width:'120px'},
+  {key:'is_external', label:'External', type:'auto', valueOf:r=>yesno(r.is_external), width:'70px'},
+  {key:'flag_for_review', label:'Flagged', type:'auto', valueOf:r=>yesno(r.flag_for_review), width:'70px'},
+  {key:'target_resolved', label:'Target in dataset', type:'auto', valueOf:r=>yesno(r.target_resolved), width:'110px'},
+  {key:'patchset', label:'Patchset', type:'auto', valueOf:r=>r.patchset===null||r.patchset===undefined?'':r.patchset, width:'70px'},
+  {key:'raw', label:'Raw match', type:'text', valueOf:r=>r.raw||'', html:r=>`<span class="mono">${esc(r.raw)}</span>`, width:'160px'},
+  {key:'target_subject', label:'Target subject', type:'text', valueOf:r=>r.target_subject||''},
+  {key:'context_snippet', label:'Context', type:'text', valueOf:r=>r.context_snippet||'',
+    html:r=>{
+      const full = r.context_hash ? CONTEXTS[r.context_hash] : null;
+      if (!full || full === r.context_snippet) {
+        return `<span class="ctx">${esc(r.context_snippet)}</span>`;
+      }
+      const rid = 'ctx-' + r.linkage_id;
+      return `<span class="ctx" id="${rid}-short">${esc(r.context_snippet)} ` +
+        `<a href="#" class="expand" onclick="toggleContext('${rid}');return false;">show full context ▾</a></span>` +
+        `<span class="ctx ctx-full hidden" id="${rid}-full">${esc(full)} ` +
+        `<a href="#" class="expand" onclick="toggleContext('${rid}');return false;">show less ▴</a></span>`;
+    }},
+];
+
+const CH_COLUMNS = [
+  {key:'number', label:'#', type:'auto', valueOf:r=>r.number, html:r=>`<span class="mono">#${r.number}</span>`, width:'80px'},
+  {key:'status', label:'Status', type:'auto', valueOf:r=>r.status||'', html:r=>pill(r.status), width:'90px'},
+  {key:'subject', label:'Subject', type:'text', valueOf:r=>r.subject||''},
+  {key:'owner_name', label:'Owner', type:'auto', valueOf:r=>r.owner_name||'', width:'120px'},
+  {key:'submitter_name', label:'Submitter', type:'auto', valueOf:r=>r.submitter_name||'', width:'120px'},
+  {key:'created', label:'Created', type:'text', valueOf:r=>(r.created||'').slice(0,10), width:'90px'},
+  {key:'num_patchsets', label:'Patchsets', type:'auto', valueOf:r=>r.num_patchsets, width:'80px'},
+  {key:'num_linkages_out', label:'Links out', type:'auto', valueOf:r=>r.num_linkages_out, width:'80px'},
+  {key:'num_linkages_in', label:'Links in', type:'auto', valueOf:r=>r.num_linkages_in, width:'80px'},
+  {key:'num_change_comments', label:'Comments', type:'auto', valueOf:r=>r.num_change_comments, width:'80px'},
+  {key:'num_inline_comments', label:'Inline', type:'auto', valueOf:r=>r.num_inline_comments, width:'80px'},
+];
+
+function buildTable(name, tableId, bodyless, columns, pagerId, countId, clearId) {
+  let data = [];
+  let filtered = [];
+  let page = 0;
+  let sortKey = null, sortDir = 1;
+  const filterState = {}; // key -> current filter value (string)
+  const colTypes = {};    // key -> 'select' | 'text' (resolved once data is known)
+
+  const table = document.getElementById(tableId);
+
+  function distinctValues(key) {
+    const s = new Set();
+    for (const r of data) {
+      const col = columns.find(c => c.key === key);
+      s.add(String(col.valueOf(r)));
+      if (s.size > MAX_SELECT_OPTIONS) return null; // too many -> use text filter
+    }
+    return Array.from(s).sort();
+  }
+
+  function distinctMultiValues(key) {
+    const col = columns.find(c => c.key === key);
+    const s = new Set();
+    for (const r of data) {
+      for (const v of col.splitValue(r)) s.add(v);
+    }
+    return Array.from(s).sort();
+  }
+
+  function buildHeader() {
+    const headRow = document.createElement('tr');
+    const filterRow = document.createElement('tr');
+    filterRow.className = 'filters';
+    columns.forEach(col => {
+      const th = document.createElement('th');
+      th.textContent = col.label;
+      th.dataset.k = col.key;
+      th.addEventListener('click', () => {
+        sortDir = (sortKey === col.key) ? -sortDir : 1;
+        sortKey = col.key;
+        table.querySelectorAll('thead th').forEach(x => x.classList.remove('sorted'));
+        th.classList.add('sorted');
+        applyFilters();
+      });
+      if (col.width) th.style.width = col.width;
+      headRow.appendChild(th);
+
+      const fth = document.createElement('th');
+      let resolvedType = col.type;
+      if (col.type === 'auto') {
+        const opts = distinctValues(col.key);
+        resolvedType = opts ? 'select' : 'text';
+        colTypes[col.key] = {type: resolvedType, options: opts};
+      } else if (col.type === 'multi') {
+        // e.g. "Found in field(s)": each row can have several values at once
+        // (GerritLinkage.sourceFields is string[]), so the dropdown is built
+        // from the union of individual values, and a row matches if the
+        // selected value is ANY ONE of its values — not an exact full match.
+        colTypes[col.key] = {type: 'multi', options: distinctMultiValues(col.key)};
+      } else {
+        colTypes[col.key] = {type: 'text', options: null};
+      }
+      if (colTypes[col.key].type === 'select' || colTypes[col.key].type === 'multi') {
+        const sel = document.createElement('select');
+        sel.innerHTML = '<option value="">(all)</option>' +
+          colTypes[col.key].options.map(v => `<option value="${esc(v)}">${esc(v) || '(blank)'}</option>`).join('');
+        sel.addEventListener('change', () => { filterState[col.key] = sel.value; applyFilters(); });
+        fth.appendChild(sel);
+      } else {
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.placeholder = 'filter…';
+        inp.addEventListener('input', () => { filterState[col.key] = inp.value.toLowerCase(); applyFilters(); });
+        fth.appendChild(inp);
+      }
+      filterRow.appendChild(fth);
+    });
+    const thead = document.createElement('thead');
+    thead.appendChild(headRow);
+    thead.appendChild(filterRow);
+    table.innerHTML = '';
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    tbody.id = tableId + '-body';
+    table.appendChild(tbody);
+  }
+
+  function matchesRow(r) {
+    for (const col of columns) {
+      const fv = filterState[col.key];
+      if (!fv) continue;
+      const ctype = colTypes[col.key] ? colTypes[col.key].type : 'text';
+      if (ctype === 'multi') {
+        const values = col.splitValue(r).map(v => v.toLowerCase());
+        if (!values.includes(fv.toLowerCase())) return false;
+        continue;
+      }
+      const rv = String(col.valueOf(r)).toLowerCase();
+      if (ctype === 'select') {
+        if (rv !== fv.toLowerCase()) return false;
+      } else {
+        if (!rv.includes(fv)) return false;
+      }
+    }
+    return true;
+  }
+
+  function render() {
+    const tbody = document.getElementById(tableId + '-body');
+    const start = page * PAGE_SIZE;
+    const rows = filtered.slice(start, start + PAGE_SIZE);
+    tbody.innerHTML = rows.map(r => '<tr>' + columns.map(col =>
+      `<td>${col.html ? col.html(r) : esc(col.valueOf(r))}</td>`).join('') + '</tr>').join('');
+    const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    document.getElementById(pagerId).innerHTML =
+      `<button ${page<=0?'disabled':''} id="${pagerId}-prev">‹ prev</button>` +
+      `<span>page ${page+1} / ${pages}</span>` +
+      `<button ${page>=pages-1?'disabled':''} id="${pagerId}-next">next ›</button>`;
+    document.getElementById(pagerId + '-prev').onclick = () => { if (page>0) { page--; render(); } };
+    document.getElementById(pagerId + '-next').onclick = () => { if (page<pages-1) { page++; render(); } };
+    document.getElementById(countId).textContent = `${filtered.length.toLocaleString()} / ${data.length.toLocaleString()} rows shown`;
+  }
+
+  function applyFilters() {
+    filtered = data.filter(matchesRow);
+    if (sortKey) {
+      const col = columns.find(c => c.key === sortKey);
+      filtered.sort((a,b) => {
+        const av = col.valueOf(a), bv = col.valueOf(b);
+        if (av === bv) return 0;
+        if (av === null || av === undefined || av === '') return 1;
+        if (bv === null || bv === undefined || bv === '') return -1;
+        return (av > bv ? 1 : -1) * sortDir;
+      });
+    }
+    page = 0;
+    render();
+  }
+
+  document.getElementById(clearId).addEventListener('click', () => {
+    Object.keys(filterState).forEach(k => delete filterState[k]);
+    table.querySelectorAll('select').forEach(s => s.value = '');
+    table.querySelectorAll('input[type=text]').forEach(i => i.value = '');
+    applyFilters();
+  });
+
+  return {
+    setData(d) { data = d; buildHeader(); applyFilters(); },
+    jumpFilter(key, value) {
+      filterState[key] = String(value).toLowerCase();
+      const idx = columns.findIndex(c => c.key === key);
+      const fth = table.querySelectorAll('thead tr.filters th')[idx];
+      const el = fth.querySelector('select,input');
+      if (el) el.value = value;
+      applyFilters();
+    },
+  };
+}
+
+const lkCtrl = buildTable('lk', 'lk-table', true, LK_COLUMNS, 'lk-pager', 'lk-count', 'lk-clear');
+const chCtrl = buildTable('ch', 'ch-table', true, CH_COLUMNS, 'ch-pager', 'ch-count', 'ch-clear');
+
+function jumpToChange(number) {
+  document.querySelector('.tab[data-tab="changes"]').click();
+  chCtrl.jumpFilter('number', number);
+}
+
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('panel-linkages').classList.toggle('hidden', t.dataset.tab !== 'linkages');
+  document.getElementById('panel-changes').classList.toggle('hidden', t.dataset.tab !== 'changes');
+}));
+
+Promise.all([
+  fetch('linkages.json').then(r => r.json()),
+  fetch('changes.json').then(r => r.json()),
+  fetch('contexts.json').then(r => r.json()),
+]).then(([linkages, changes, contexts]) => {
+  CONTEXTS = contexts;
+  lkCtrl.setData(linkages);
+  chCtrl.setData(changes);
+  document.getElementById('stats').innerHTML = "<div class=\"stat\"><b>100,361</b><span>changes</span></div><div class=\"stat\"><b>5,605</b><span>linkages</span></div><div class=\"stat\"><b>3,599</b><span>resolved in-project</span></div><div class=\"stat\"><b>3,656</b><span>external</span></div><div class=\"stat\"><b>12</b><span>flagged for review</span></div>";
+}).catch(err => {
+  document.body.insertAdjacentHTML('afterbegin',
+    '<div style="padding:16px;background:#3a1f1f;color:#ffb4b4">Could not load linkages.json / changes.json / contexts.json. ' +
+    'Browsers block fetch() on local files opened directly — run <code>python3 -m http.server</code> ' +
+    'inside the report folder and open http://localhost:8000/dashboard.html instead.</div>');
+  console.error(err);
+});
+</script>
+</body>
+</html>
