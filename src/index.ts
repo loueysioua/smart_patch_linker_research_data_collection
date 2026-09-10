@@ -45,7 +45,13 @@
  */
 import * as fs from "fs";
 import * as path from "path";
-import { GerritClient } from "./gerrit-client";
+import {
+  GerritClient,
+  parallelMap,
+  withRetry,
+  LIST_OPTIONS_MINIMAL,
+  LIST_OPTIONS_FULL,
+} from "./gerrit-client";
 import {
   mapChangeToMetadata,
   mapChangePatchsets,
@@ -71,7 +77,9 @@ import type { ChangeInfo } from "@gerritcodereview/typescript-api/rest-api";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const GERRIT_BASE_URL = "https://gerrit.libreoffice.org/" as const;
+//const GERRIT_BASE_URL = "https://gerrit.libreoffice.org/" as const;
+const GERRIT_BASE_URL = "https://review.opendev.org/" as const;
+
 const DEFAULT_OUTPUT = "./output/changes" as const;
 const DEFAULT_QUERY = "is:open" as const;
 const DEFAULT_CONCURRENCY = 6;
@@ -107,7 +115,7 @@ function parseArgs(argv: string[]): CliArgs {
   let rateMax = 30;
   let rateWindowMs = 10_000;
   let rateIntervalMs = 200;
-  let timeoutMs = 30000;
+  let timeoutMs = 300000;
   let mode: CliArgs["mode"] = "all";
   let gerritUrl: string = GERRIT_BASE_URL;
 
@@ -244,7 +252,9 @@ async function enrichMetadata(
   const changeId = Number(change._number);
   let commitInfo: RawCommitInfo = {};
   try {
-    commitInfo = await client.fetchCommitInfo(changeId, "current");
+    commitInfo = await withRetry(() =>
+      client.fetchCommitInfo(changeId, "current"),
+    );
   } catch (err) {
     console.warn(`  [enrich] commit fetch failed for #${changeId}:`, err);
   }
@@ -258,12 +268,15 @@ async function enrichPatchsets(
   const changeId = Number(change._number);
   const revisions = change.revisions ?? {};
   const revShas = Object.keys(revisions);
-  const filesPerRevision = new Map<string, RawFilesResponse>();
 
-  for (const sha of revShas) {
+  // Fan out all per-revision file-list fetches in parallel (bounded by the
+  // rate limiter inside each fetchFiles call — no extra concurrency cap needed
+  // here because the outer sliding window already limits change-level tasks).
+  const filesPerRevision = new Map<string, RawFilesResponse>();
+  await parallelMap(revShas, revShas.length, async (sha) => {
     let rawFiles: RawFilesResponse = {};
     try {
-      rawFiles = await client.fetchFiles(changeId, sha);
+      rawFiles = await withRetry(() => client.fetchFiles(changeId, sha));
     } catch (err) {
       console.warn(
         `  [enrich] files fetch failed for #${changeId}@${sha.slice(0, 7)}:`,
@@ -271,7 +284,7 @@ async function enrichPatchsets(
       );
     }
     filesPerRevision.set(sha, rawFiles);
-  }
+  });
 
   return mapChangePatchsets(change, filesPerRevision);
 }
@@ -286,10 +299,11 @@ async function enrichDiffs(
   const filesPerRevision = new Map<string, RawFilesResponse>();
   const diffsPerRevision = new Map<string, Map<string, RawDiffInfo>>();
 
-  for (const sha of revShas) {
+  // Fetch file lists for all revisions in parallel.
+  await parallelMap(revShas, revShas.length, async (sha) => {
     let rawFiles: RawFilesResponse = {};
     try {
-      rawFiles = await client.fetchFiles(changeId, sha);
+      rawFiles = await withRetry(() => client.fetchFiles(changeId, sha));
     } catch (err) {
       console.warn(
         `  [enrich] files fetch failed for #${changeId}@${sha.slice(0, 7)}:`,
@@ -297,12 +311,19 @@ async function enrichDiffs(
       );
     }
     filesPerRevision.set(sha, rawFiles);
+  });
 
+  // For each revision, fetch all file diffs in parallel.
+  await parallelMap(revShas, revShas.length, async (sha) => {
+    const rawFiles = filesPerRevision.get(sha) ?? {};
+    const filePaths = Object.keys(rawFiles).filter((p) => p !== "/COMMIT_MSG");
     const diffMap = new Map<string, RawDiffInfo>();
-    for (const filePath of Object.keys(rawFiles)) {
-      if (filePath === "/COMMIT_MSG") continue;
+
+    await parallelMap(filePaths, filePaths.length, async (filePath) => {
       try {
-        const diff = await client.fetchFileDiff(changeId, sha, filePath);
+        const diff = await withRetry(() =>
+          client.fetchFileDiff(changeId, sha, filePath),
+        );
         diffMap.set(filePath, diff);
       } catch (err) {
         console.warn(
@@ -310,9 +331,10 @@ async function enrichDiffs(
           (err as Error).message,
         );
       }
-    }
+    });
+
     diffsPerRevision.set(sha, diffMap);
-  }
+  });
 
   return mapChangeDiffs(change, diffsPerRevision, filesPerRevision);
 }
@@ -324,7 +346,7 @@ async function enrichComments(
   const changeId = Number(change._number);
   let rawComments: RawCommentsResponse = {};
   try {
-    rawComments = await client.fetchComments(changeId);
+    rawComments = await withRetry(() => client.fetchComments(changeId));
   } catch (err) {
     console.warn(`  [enrich] comments fetch failed for #${changeId}:`, err);
   }
@@ -642,17 +664,22 @@ async function main(): Promise<void> {
     },
   });
 
-  // Fetch the full change list once for the entire run
-  console.log(`[index] Fetching change list from Gerrit…`);
-  const allRawChanges = await client.fetchAllChanges(query, limit);
-  console.log(
-    `[index] Found ${allRawChanges.length} change(s) matching query.`,
-  );
-
   const modesToRun: ("metadata" | "patchsets" | "diffs" | "comments")[] =
     mode === "all"
       ? ["metadata", "patchsets", "diffs", "comments"]
       : [mode as any];
+
+  /**
+   * Choose which Gerrit list options to request.
+   * - metadata and comments only need DETAILED_ACCOUNTS + MESSAGES.
+   *   Skipping ALL_REVISIONS makes each page response 3–10× smaller.
+   * - patchsets and diffs need ALL_REVISIONS because they iterate over
+   *   change.revisions in the enrichment functions.
+   */
+  const needsRevisions = modesToRun.some(
+    (m) => m === "patchsets" || m === "diffs",
+  );
+  const listOptions = needsRevisions ? LIST_OPTIONS_FULL : LIST_OPTIONS_MINIMAL;
 
   const writer = new ChangeWriter(output);
 
@@ -661,20 +688,12 @@ async function main(): Promise<void> {
     console.log(`  Processing Mode: ${activeMode.toUpperCase()}`);
     console.log("─".repeat(60));
 
-    // ── Checkpoint: scan output directory for active mode ───────────────────
+    // ── Checkpoint: scan output directory for active mode ───────────────────────
     const checkpoint = new CheckpointManager(output, activeMode);
     const { cleanIds, corruptIds } = checkpoint.analyse();
 
-    // Decide which changes need enrichment for this mode
-    const changesToEnrich = allRawChanges.filter(
-      (c) => !cleanIds.has(Number(c._number)),
-    );
-
     console.log(
       `[index] [${activeMode}] Already written (skip): ${cleanIds.size}`,
-    );
-    console.log(
-      `[index] [${activeMode}] To enrich             : ${changesToEnrich.length}`,
     );
     if (corruptIds.size > 0) {
       console.log(
@@ -682,41 +701,62 @@ async function main(): Promise<void> {
       );
     }
 
-    if (changesToEnrich.length === 0) {
-      console.log(`[index] [${activeMode}] All files up-to-date. Skipping.`);
-      continue;
+    let enriched = 0;
+    let skipped = 0;
+
+    /**
+     * Process one page of changes: filter already-done IDs, build tasks,
+     * run the sliding-window pool, and write results immediately.
+     */
+    const processPage = async (page: ChangeInfo[]): Promise<void> => {
+      const changesToEnrich = page.filter(
+        (c) => !cleanIds.has(Number(c._number)),
+      );
+      skipped += page.length - changesToEnrich.length;
+      if (changesToEnrich.length === 0) return;
+
+      const tasks = changesToEnrich.map((change) => async () => {
+        const num = Number(change._number);
+        const label = `#${num} – ${String(change.subject).slice(0, 50)}`;
+        const tag = corruptIds.has(num) ? " [RE-FETCH]" : "";
+        console.log(
+          `[index] [${activeMode}] Enriching [${++enriched}]${tag} ${label}`,
+        );
+
+        let result: unknown;
+        if (activeMode === "metadata") {
+          result = await enrichMetadata(client, change);
+        } else if (activeMode === "patchsets") {
+          result = await enrichPatchsets(client, change);
+        } else if (activeMode === "diffs") {
+          result = await enrichDiffs(client, change);
+        } else {
+          result = await enrichComments(client, change);
+        }
+
+        return { num, result };
+      });
+
+      await runWithSlidingWindow(tasks, concurrency, ({ num, result }) => {
+        writer.write(num, activeMode, result);
+      });
+    };
+
+    // Stream pages from Gerrit; start enriching each page immediately
+    // so enrichment overlaps with fetching subsequent pages.
+    console.log(`[index] [${activeMode}] Streaming change list from Gerrit…`);
+    for await (const page of client.fetchAllChangesStream(
+      query,
+      limit,
+      listOptions,
+      cleanIds,
+    )) {
+      await processPage(page);
     }
 
-    let enriched = 0;
-    const total = changesToEnrich.length;
-
-    const tasks = changesToEnrich.map((change) => async () => {
-      const num = Number(change._number);
-      const label = `#${num} – ${String(change.subject).slice(0, 50)}`;
-      const tag = corruptIds.has(num) ? " [RE-FETCH]" : "";
-      console.log(
-        `[index] [${activeMode}] Enriching [${++enriched}/${total}]${tag} ${label}`,
-      );
-
-      let result: unknown;
-      if (activeMode === "metadata") {
-        result = await enrichMetadata(client, change);
-      } else if (activeMode === "patchsets") {
-        result = await enrichPatchsets(client, change);
-      } else if (activeMode === "diffs") {
-        result = await enrichDiffs(client, change);
-      } else {
-        result = await enrichComments(client, change);
-      }
-
-      return { num, result };
-    });
-
-    await runWithSlidingWindow(tasks, concurrency, ({ num, result }) => {
-      writer.write(num, activeMode, result);
-    });
-
-    console.log(`[index] [${activeMode}] Completed ✓`);
+    console.log(
+      `[index] [${activeMode}] Completed ✓ (enriched: ${enriched}, skipped: ${skipped})`,
+    );
   }
 
   console.log("\n" + "═".repeat(60));

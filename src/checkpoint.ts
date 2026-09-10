@@ -132,12 +132,30 @@ export class CheckpointManager {
     );
 
     let corrupt = 0;
+    const existingFiles: { dir: string; num: number; filePath: string; mtimeMs: number }[] = [];
+
     for (const dir of changeDirs) {
       const num = parseInt(dir, 10);
       const filePath = path.join(this.outputDir, dir, `${this.mode}.json`);
 
-      if (!fs.existsSync(filePath)) {
-        // Mode file does not exist, so it needs to be fetched
+      if (fs.existsSync(filePath)) {
+        const stat = fs.statSync(filePath);
+        existingFiles.push({ dir, num, filePath, mtimeMs: stat.mtimeMs });
+      }
+    }
+
+    // Sort descending by modification time
+    existingFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    // Only do full integrity check on the 100 most recently modified files
+    const CHECK_LIMIT = 100;
+
+    for (let i = 0; i < existingFiles.length; i++) {
+      const { dir, num, filePath } = existingFiles[i];
+
+      if (i >= CHECK_LIMIT) {
+        // Assume older files are valid
+        cleanIds.add(num);
         continue;
       }
 

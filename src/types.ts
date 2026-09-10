@@ -164,6 +164,11 @@ export interface PatchsetInfo {
   readonly created: Timestamp;
   /** List of file paths modified in this specific patchset. */
   readonly modified_file_paths: string[];
+  /**
+   * The full commit message text for this patchset.
+   * Null when the commit info could not be fetched.
+   */
+  readonly commit_message: string | null;
 }
 
 /**

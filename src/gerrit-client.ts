@@ -12,6 +12,7 @@
  *      - GET /changes/{id}/comments                 → inline comments
  *  - Token-bucket rate limiting so we never exceed Gerrit's request quota.
  *  - Per-request AbortController timeout.
+ *  - Exponential-backoff retry on transient failures.
  *
  * Gerrit REST API reference:
  * https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html
@@ -35,12 +36,20 @@ const GERRIT_XSSI_PREFIX = ")]}'\n" as const;
 const PAGE_SIZE = 100 as const;
 
 /**
- * Query options to attach to the main changes list request.
- * DETAILED_ACCOUNTS  → AccountInfo objects include name/email/username.
- * ALL_REVISIONS      → All patchset RevisionInfo entries are returned inline.
- * MESSAGES           → The change-level message thread is included inline.
+ * Minimal option set for modes that only need basic change fields
+ * (metadata, comments). Omitting ALL_REVISIONS shrinks page payloads
+ * dramatically — the server doesn't have to serialize every patchset.
  */
-const LIST_OPTIONS: readonly string[] = [
+export const LIST_OPTIONS_MINIMAL: readonly string[] = [
+  "DETAILED_ACCOUNTS",
+  "MESSAGES",
+] as const;
+
+/**
+ * Full option set — used when the caller needs revision data
+ * (patchsets / diffs modes).
+ */
+export const LIST_OPTIONS_FULL: readonly string[] = [
   "DETAILED_ACCOUNTS",
   "ALL_REVISIONS",
   "MESSAGES",
@@ -246,6 +255,85 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Retries `fn` up to `maxAttempts` times with exponential back-off.
+ * Only retries on timeout / network errors; propagates 4xx/5xx immediately.
+ *
+ * @param fn           Async function to call.
+ * @param maxAttempts  Total attempts (1 = no retry).
+ * @param baseDelayMs  Initial back-off delay in ms (doubles each attempt).
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+  baseDelayMs = 1_000,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // Don't retry hard HTTP errors (4xx / 5xx), except for transient ones (502, 503, 504, 429).
+      if (
+        msg.includes("Gerrit API error:") &&
+        !msg.match(/429|502|503|504/)
+      ) {
+        throw err;
+      }
+      if (attempt < maxAttempts) {
+        const delay = baseDelayMs * 2 ** (attempt - 1);
+        console.warn(
+          `[GerritClient] Attempt ${attempt}/${maxAttempts} failed (${msg.slice(0, 80)}). Retrying in ${delay}ms…`,
+        );
+        await sleep(delay);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Runs `items` through `fn` with at most `concurrency` tasks in-flight.
+ * Unlike `Promise.all`, this starts a new task as soon as any slot opens.
+ *
+ * This is intentionally NOT rate-limited here — the GerritClient's internal
+ * RateLimiter handles that.  parallelMap just controls task fan-out so we
+ * don't queue thousands of promises at once.
+ */
+export async function parallelMap<A, B>(
+  items: A[],
+  concurrency: number,
+  fn: (item: A) => Promise<B>,
+): Promise<B[]> {
+  const results: B[] = new Array(items.length);
+  let nextIndex = 0;
+  let inFlight = 0;
+
+  return new Promise((resolve, reject) => {
+    const tryLaunch = (): void => {
+      while (inFlight < concurrency && nextIndex < items.length) {
+        const idx = nextIndex++;
+        inFlight++;
+        fn(items[idx])
+          .then((val) => {
+            results[idx] = val;
+            inFlight--;
+            if (nextIndex < items.length) {
+              tryLaunch();
+            } else if (inFlight === 0) {
+              resolve(results);
+            }
+          })
+          .catch(reject);
+      }
+      if (inFlight === 0 && nextIndex >= items.length) resolve(results);
+    };
+    tryLaunch();
+  });
+}
+
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 export interface GerritClientOptions {
@@ -327,46 +415,66 @@ export class GerritClient {
   // ─── Change list ──────────────────────────────────────────────────────────
 
   /**
-   * Fetches ALL changes matching the given query, automatically following
-   * the _more_changes pagination signal.
-   *
-   * @param query  Gerrit search expression (default: "is:open").
-   * @param limit  Optional hard cap on the total number of changes returned.
+   * Fetches ONE page of changes and returns it along with the raw list.
+   * Internal helper used by both fetchAllChanges and fetchAllChangesStream.
    */
-  async fetchAllChanges(
+  private async fetchChangesPage(
+    query: string,
+    start: number,
+    pageSize: number,
+    options: readonly string[],
+  ): Promise<RawChangeListItem[]> {
+    const url = new URL(`${this.baseUrl}/changes/`);
+    url.searchParams.set("q", query);
+    url.searchParams.set("n", String(pageSize));
+    url.searchParams.set("S", String(start));
+    for (const opt of options) {
+      url.searchParams.append("o", opt);
+    }
+    return withRetry(() => this.getJson<RawChangeListItem[]>(url));
+  }
+
+  /**
+   * Async generator that yields each page of changes as it arrives.
+   * Enrichment can begin processing the first page while subsequent pages
+   * are still being fetched — no need to wait for the full list.
+   *
+   * @param query    Gerrit search expression.
+   * @param limit    Optional hard cap on total changes yielded.
+   * @param options  Which o= query options to include (controls payload size).
+   */
+  async *fetchAllChangesStream(
     query: string = "is:open",
     limit?: number,
-  ): Promise<ChangeInfo[]> {
-    const accumulated: ChangeInfo[] = [];
+    options: readonly string[] = LIST_OPTIONS_FULL,
+    resumeIds?: Set<number>,
+  ): AsyncGenerator<ChangeInfo[]> {
     let start = 0;
+    let fetched = 0;
+    let hasFastForwarded = false;
 
-    console.log(`[GerritClient] Fetching changes: query="${query}"`);
+    console.log(`[GerritClient] Streaming changes: query="${query}"`);
 
     while (true) {
       const pageSize = limit
-        ? Math.min(PAGE_SIZE, limit - accumulated.length)
+        ? Math.min(PAGE_SIZE, limit - fetched)
         : PAGE_SIZE;
 
-      const url = new URL(`${this.baseUrl}/changes/`);
-      url.searchParams.set("q", query);
-      url.searchParams.set("n", String(pageSize));
-      url.searchParams.set("S", String(start));
-      for (const opt of LIST_OPTIONS) {
-        url.searchParams.append("o", opt);
-      }
+      if (pageSize <= 0) break;
 
       console.log(`[GerritClient] → page start=${start}, n=${pageSize}`);
-
-      const page = await this.getJson<RawChangeListItem[]>(url);
+      const page = await this.fetchChangesPage(query, start, pageSize, options);
 
       if (!Array.isArray(page) || page.length === 0) break;
 
-      accumulated.push(...page);
+      fetched += page.length;
       console.log(
-        `[GerritClient] ← ${page.length} items (total: ${accumulated.length})`,
+        `[GerritClient] ← ${page.length} items (total so far: ${fetched})`,
       );
 
-      if (limit !== undefined && accumulated.length >= limit) {
+      yield page;
+
+      if (limit !== undefined && fetched >= limit) {
         console.log(`[GerritClient] Limit of ${limit} reached.`);
         break;
       }
@@ -377,8 +485,91 @@ export class GerritClient {
       }
 
       start += page.length;
-    }
 
+      // ── Fast-forward optimization ──────────────────────────────────────────
+      // If the current page was 100% already fetched, we assume we are inside
+      // a large contiguous block of cached results. We probe forward to find
+      // the end of this block logarithmically to skip thousands of redundant API calls.
+      if (resumeIds && !hasFastForwarded && resumeIds.size > 0 && limit === undefined) {
+        const allClean = page.every((c) => resumeIds.has(Number(c._number)));
+        if (allClean) {
+          console.log(
+            `[GerritClient] Page at offset ${start - page.length} is fully cached. Fast-forwarding...`,
+          );
+          let step = PAGE_SIZE;
+          let lastClean = start - page.length;
+          let firstDirty: number | null = null;
+          let probeStart = start;
+
+          // 1. Exponential search forward
+          while (true) {
+            const probePage = await this.fetchChangesPage(query, probeStart, PAGE_SIZE, options);
+            if (!probePage || probePage.length === 0) {
+              firstDirty = probeStart;
+              break;
+            }
+            const probeClean = probePage.every((c) => resumeIds.has(Number(c._number)));
+            if (probeClean) {
+              lastClean = probeStart;
+              if (!probePage[probePage.length - 1]._more_changes) {
+                firstDirty = probeStart + probePage.length;
+                break;
+              }
+              step *= 2;
+              probeStart += step;
+            } else {
+              firstDirty = probeStart;
+              break;
+            }
+          }
+
+          // 2. Binary search between lastClean and firstDirty
+          let low = lastClean;
+          let high = firstDirty;
+          while (high - low > PAGE_SIZE) {
+            const midPages = Math.floor((high - low) / (2 * PAGE_SIZE));
+            if (midPages === 0) break;
+            const mid = low + midPages * PAGE_SIZE;
+
+            const probePage = await this.fetchChangesPage(query, mid, PAGE_SIZE, options);
+            if (!probePage || probePage.length === 0) {
+              high = mid;
+            } else {
+              const probeClean = probePage.every((c) => resumeIds.has(Number(c._number)));
+              if (probeClean) {
+                low = mid;
+              } else {
+                high = mid;
+              }
+            }
+          }
+
+          start = low + PAGE_SIZE;
+          hasFastForwarded = true;
+          console.log(`[GerritClient] Fast-forward complete. Resuming at offset ${start}.`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Convenience wrapper — collects all pages into a single array.
+   * Prefer fetchAllChangesStream when you can start processing early.
+   *
+   * @param query    Gerrit search expression (default: "is:open").
+   * @param limit    Optional hard cap on the total number of changes returned.
+   * @param options  Which o= query options to include.
+   */
+  async fetchAllChanges(
+    query: string = "is:open",
+    limit?: number,
+    options: readonly string[] = LIST_OPTIONS_FULL,
+    resumeIds?: Set<number>,
+  ): Promise<ChangeInfo[]> {
+    const accumulated: ChangeInfo[] = [];
+    for await (const page of this.fetchAllChangesStream(query, limit, options, resumeIds)) {
+      accumulated.push(...page);
+    }
     return accumulated;
   }
 

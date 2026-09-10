@@ -4,7 +4,9 @@ analyze_gerrit_linkages.py
 ===========================
 
 Turns a project's retrieved Gerrit data (metadata.json / linkages.json /
-comments.json / patchsets.json, one folder per change) into something you
+comments.json / patchsets.json, one folder per change — metadata.json is
+optional; any folder containing at least one of these files is processed)
+into something you
 can actually read and query:
 
   1. <report-dir>/<project>.db         - one SQLite DB, EVERY change and
@@ -86,7 +88,15 @@ REACTION_RE = re.compile(
     "|".join(re.escape(k) for k in REACTION_KEYWORDS), re.IGNORECASE
 )
 
-CHANGE_FOLDER_REQUIRED_FILES = ("metadata.json",)
+# A change folder is considered valid if it contains *at least one* of these
+# files.  metadata.json is no longer required — the script will still extract
+# linkages, comments, and patchset counts from whichever files are present.
+CHANGE_FOLDER_KNOWN_FILES = (
+    "metadata.json",
+    "linkages.json",
+    "comments.json",
+    "patchsets.json",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,48 +277,68 @@ class ProjectStats:
     total_reactions: int = 0
     parse_errors: list[str] = field(default_factory=list)
     total_subdirs: int = 0
-    dirs_missing_metadata: list[str] = field(default_factory=list)
+    dirs_no_data_files: list[str] = field(default_factory=list)   # no known data file at all
+    dirs_missing_metadata: list[str] = field(default_factory=list)  # kept for compat / logging
     dirs_unreadable_metadata: list[str] = field(default_factory=list)
     duplicate_change_keys: list[str] = field(default_factory=list)
 
 
 def find_change_dirs(project_dir: Path, stats: ProjectStats) -> list[Path]:
     """Every immediate subdirectory of the project folder is treated as a
-    candidate change. Anything that doesn't yield a usable change is recorded
-    in `stats` instead of being silently dropped, so counts are explainable."""
+    candidate change.  A folder is accepted as long as it contains *at least
+    one* of the known data files (metadata.json / linkages.json /
+    comments.json / patchsets.json) — metadata.json is no longer required.
+    Folders with no recognised data file at all are recorded in
+    `stats.dirs_no_data_files` and skipped.  Anything else that can't be
+    ingested is recorded in `stats` for a fully explainable count."""
     dirs = []
     all_subdirs = [c for c in sorted(project_dir.iterdir()) if c.is_dir()]
     stats.total_subdirs = len(all_subdirs)
     for child in all_subdirs:
+        has_any = any((child / f).exists() for f in CHANGE_FOLDER_KNOWN_FILES)
+        if not has_any:
+            stats.dirs_no_data_files.append(child.name)
+            continue
+        # If metadata.json is present, do a cheap validity check so corrupt
+        # JSON is reported with the folder name rather than swallowed later.
         meta_path = child / "metadata.json"
-        if not meta_path.exists():
-            stats.dirs_missing_metadata.append(child.name)
-            continue
-        # Cheap validity check up front so bad JSON is reported with a name,
-        # not just silently absorbed later.
-        try:
-            with meta_path.open("r", encoding="utf-8") as f:
-                json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            stats.dirs_unreadable_metadata.append(f"{child.name}: {e}")
-            continue
+        if meta_path.exists():
+            try:
+                with meta_path.open("r", encoding="utf-8") as f:
+                    json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                stats.dirs_unreadable_metadata.append(f"{child.name}: {e}")
+                # Still include the folder — the other files may be fine.
+                # ingest_change will just treat metadata as None.
         dirs.append(child)
     return dirs
 
 
 def ingest_change(cur: sqlite3.Cursor, change_dir: Path, project: str,
                    seen_keys: dict) -> tuple[int, int, int]:
-    """Load one change folder into the DB. Returns (linkages, comments, log)."""
-    metadata = load_json(change_dir / "metadata.json")
-    if metadata is None:
-        return 0, 0, 0
+    """Load one change folder into the DB. Returns (linkages, comments, log).
+
+    metadata.json is optional — if absent or unparseable the change is still
+    ingested using whatever other files (linkages.json / comments.json /
+    patchsets.json) are present.  All metadata-derived fields (change_id,
+    number, status, timestamps, owner, etc.) simply become NULL/0 in the DB.
+    The change_key falls back to the directory name in that case.
+    """
+    metadata = load_json(change_dir / "metadata.json")  # may be None — that is fine
 
     linkages = load_json(change_dir / "linkages.json") or []
     comments = load_json(change_dir / "comments.json") or {}
     patchsets = load_json(change_dir / "patchsets.json") or []
 
-    change_key = metadata.get("id") or change_dir.name
-    number = metadata.get("_number")
+    # Derive identity from metadata when available; fall back to the folder
+    # name so the row is always uniquely addressable in the DB.
+    if isinstance(metadata, dict):
+        change_key = metadata.get("id") or change_dir.name
+        number = metadata.get("_number")
+    else:
+        metadata = {}  # treat as empty dict so all get() calls below are safe
+        change_key = change_dir.name
+        number = None
 
     if change_key in seen_keys:
         raise ValueError(
@@ -581,11 +611,14 @@ def build_summary(db_path: Path, project: str, report_dir: Path, stats: ProjectS
     def pct(n, d):
         return f"{(100.0 * n / d):.1f}%" if d else "0%"
 
-    n_missing_meta = len(stats.dirs_missing_metadata)
+    n_no_data = len(stats.dirs_no_data_files)
     n_bad_meta = len(stats.dirs_unreadable_metadata)
     n_dupe = len(stats.duplicate_change_keys)
     n_other = len(stats.parse_errors)
-    n_skipped = n_missing_meta + n_bad_meta + n_dupe + n_other
+    # dirs_missing_metadata is no longer a skip reason — folders without
+    # metadata.json are still ingested if any other data file is present.
+    # Only dirs_no_data_files (no recognised file at all) are skipped.
+    n_skipped = n_no_data + n_dupe + n_other
 
     lines = []
     a = lines.append
@@ -595,18 +628,22 @@ def build_summary(db_path: Path, project: str, report_dir: Path, stats: ProjectS
     a("## 1. Coverage check\n")
     a(f"- **Subfolders found under the project directory:** {stats.total_subdirs:,}")
     a(f"- **Successfully ingested as changes:** {stats.total_changes:,}")
+    if n_bad_meta:
+        a(f"- **Note:** {n_bad_meta:,} subfolder(s) had a `metadata.json` that **failed to parse** "
+          f"(truncated/corrupt JSON). Those folders were still ingested from their other data files "
+          f"(linkages.json / comments.json / patchsets.json); metadata fields will be NULL for them.")
     if n_skipped:
         a(f"- **Skipped: {n_skipped:,}** — see the breakdown below and the full list in `skipped_dirs.log`.")
-        if n_missing_meta:
-            a(f"  - {n_missing_meta:,} subfolder(s) had **no `metadata.json`** at all.")
-        if n_bad_meta:
-            a(f"  - {n_bad_meta:,} subfolder(s) had a `metadata.json` that **failed to parse** (truncated/corrupt JSON — often a sign the retrieval script was interrupted mid-write for that change).")
+        if n_no_data:
+            a(f"  - {n_no_data:,} subfolder(s) contained **no recognised data file** "
+              f"(no metadata.json, linkages.json, comments.json, or patchsets.json).")
         if n_dupe:
-            a(f"  - {n_dupe:,} subfolder(s) produced a **change id that duplicated another folder's** — only the first-seen folder for that id was kept, so no change was double-counted.")
+            a(f"  - {n_dupe:,} subfolder(s) produced a **change id that duplicated another folder's** "
+              f"— only the first-seen folder for that id was kept, so no change was double-counted.")
         if n_other:
             a(f"  - {n_other:,} subfolder(s) hit another error while ingesting (see `skipped_dirs.log`).")
     else:
-        a("- **Skipped: 0** — every subfolder with a `metadata.json` was ingested.")
+        a("- **Skipped: 0** — every subfolder containing at least one data file was ingested.")
     a("")
 
     a("## 2. Headline numbers\n")
@@ -695,14 +732,10 @@ def build_summary(db_path: Path, project: str, report_dir: Path, stats: ProjectS
 
     if n_skipped:
         a("## Appendix: skipped folders (sample — full list in `skipped_dirs.log`)\n")
-        if stats.dirs_missing_metadata:
-            a(f"**No metadata.json** ({n_missing_meta}):")
-            for name in stats.dirs_missing_metadata[:25]:
+        if stats.dirs_no_data_files:
+            a(f"**No recognised data file (skipped)** ({n_no_data}):")
+            for name in stats.dirs_no_data_files[:25]:
                 a(f"- {name}")
-        if stats.dirs_unreadable_metadata:
-            a(f"\n**Unreadable metadata.json** ({n_bad_meta}):")
-            for e in stats.dirs_unreadable_metadata[:25]:
-                a(f"- {e}")
         if stats.duplicate_change_keys:
             a(f"\n**Duplicate change ids** ({n_dupe}):")
             for e in stats.duplicate_change_keys[:25]:
@@ -711,6 +744,15 @@ def build_summary(db_path: Path, project: str, report_dir: Path, stats: ProjectS
             a(f"\n**Other errors** ({n_other}):")
             for e in stats.parse_errors[:25]:
                 a(f"- {e}")
+    if stats.dirs_unreadable_metadata:
+        a(f"\n## Appendix: folders with corrupt/unreadable metadata.json (still ingested)\n")
+        a("These folders had a `metadata.json` that failed to parse but were still ingested "
+          "from their other data files (linkages.json / comments.json / patchsets.json). "
+          "Metadata fields (status, owner, timestamps, etc.) will be NULL for these changes.\n")
+        for e in stats.dirs_unreadable_metadata[:25]:
+            a(f"- {e}")
+        if len(stats.dirs_unreadable_metadata) > 25:
+            a(f"\n_(and {len(stats.dirs_unreadable_metadata) - 25} more — see `skipped_dirs.log`)_")
 
     (report_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
     conn.close()
@@ -827,8 +869,10 @@ function toggleContext(rid) {{
 // html(row)    -> what's rendered in the cell (defaults to esc(valueOf(row)))
 
 const LK_COLUMNS = [
-  {{key:'source_number', label:'Source #', type:'auto', valueOf:r=>r.source_number, width:'80px',
-    html:r=>`<a href="#" class="mono" onclick="jumpToChange(${{r.source_number}});return false;">#${{r.source_number}}</a>`}},
+  {{key:'source_number', label:'Source', type:'auto', valueOf:r=>r.source_number!==null&&r.source_number!==undefined ? r.source_number : (r.source_change_key||''), width:'120px',
+    html:r=>r.source_number!==null&&r.source_number!==undefined
+      ? `<a href="#" class="mono" onclick="jumpToChange(${{r.source_number}});return false;">#${{r.source_number}}</a>`
+      : `<span class="mono" title="${{esc(r.source_change_key)}}">${{esc(r.source_change_key)}}</span>`}},
   {{key:'target_number', label:'Target #', type:'auto', valueOf:r=>r.target_number, width:'80px',
     html:r=>r.target_number ? `<span class="mono">#${{r.target_number}}</span>` : ''}},
   {{key:'target_status', label:'Target status', type:'auto', valueOf:r=>r.target_status||'', html:r=>pill(r.target_status), width:'90px'}},
@@ -1125,27 +1169,29 @@ def run_one(output_dir: Path, project: str, report_root: Path):
     stats = ingest_project(output_dir, project, db_path)
     print(f"  subfolders found: {stats.total_subdirs:,}")
     print(f"  changes ingested: {stats.total_changes:,}  linkages: {stats.total_linkages:,}  reactions: {stats.total_reactions:,}")
-    if stats.dirs_missing_metadata:
-        print(f"  ! {len(stats.dirs_missing_metadata)} subfolders had no metadata.json")
+    if stats.dirs_no_data_files:
+        print(f"  ! {len(stats.dirs_no_data_files)} subfolders had no recognised data file (skipped)")
     if stats.dirs_unreadable_metadata:
-        print(f"  ! {len(stats.dirs_unreadable_metadata)} subfolders had unreadable/corrupt metadata.json")
+        print(f"  ! {len(stats.dirs_unreadable_metadata)} subfolders had unreadable/corrupt metadata.json "
+              f"(still ingested from other files — metadata fields will be NULL)")
     if stats.duplicate_change_keys:
         print(f"  ! {len(stats.duplicate_change_keys)} subfolders were duplicate change_ids of another folder")
     if stats.parse_errors:
         print(f"  ! {len(stats.parse_errors)} change folders had other errors (see summary.md appendix)")
 
-    missing_total = (len(stats.dirs_missing_metadata) + len(stats.dirs_unreadable_metadata)
-                      + len(stats.duplicate_change_keys) + len(stats.parse_errors))
-    if missing_total:
+    loggable = (len(stats.dirs_no_data_files) + len(stats.dirs_unreadable_metadata)
+                + len(stats.duplicate_change_keys) + len(stats.parse_errors))
+    if loggable:
         log_path = report_dir / "skipped_dirs.log"
         with log_path.open("w", encoding="utf-8") as f:
             f.write(f"Subfolders found under project dir: {stats.total_subdirs}\n")
             f.write(f"Successfully ingested as changes:   {stats.total_changes}\n\n")
-            if stats.dirs_missing_metadata:
-                f.write(f"--- {len(stats.dirs_missing_metadata)} folders with NO metadata.json ---\n")
-                f.write("\n".join(stats.dirs_missing_metadata) + "\n\n")
+            if stats.dirs_no_data_files:
+                f.write(f"--- {len(stats.dirs_no_data_files)} folders with NO recognised data file (SKIPPED) ---\n")
+                f.write("\n".join(stats.dirs_no_data_files) + "\n\n")
             if stats.dirs_unreadable_metadata:
-                f.write(f"--- {len(stats.dirs_unreadable_metadata)} folders with UNREADABLE/CORRUPT metadata.json ---\n")
+                f.write(f"--- {len(stats.dirs_unreadable_metadata)} folders with UNREADABLE/CORRUPT metadata.json "
+                        f"(still ingested from other files) ---\n")
                 f.write("\n".join(stats.dirs_unreadable_metadata) + "\n\n")
             if stats.duplicate_change_keys:
                 f.write(f"--- {len(stats.duplicate_change_keys)} folders that DUPLICATED another folder's change id ---\n")

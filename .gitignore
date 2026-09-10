@@ -33,4 +33,5 @@ coverage/
 *.swp
 *.swo
 
-output/
+output/reports
+reports

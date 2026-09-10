@@ -227,10 +227,16 @@ export function mapChangeToMetadata(
 
 /**
  * Maps revisions in ChangeInfo to an array of PatchsetInfo.
+ *
+ * @param change             The raw ChangeInfo from the Gerrit API.
+ * @param filesPerRevision   Map of commit SHA → files response.
+ * @param commitMessages     Map of commit SHA → commit message text.
+ *                           Pass an empty Map when commit info was not fetched.
  */
 export function mapChangePatchsets(
   change: ChangeInfo,
   filesPerRevision: Map<string, RawFilesResponse>,
+  commitMessages: Map<string, string> = new Map(),
 ): PatchsetInfo[] {
   const revisions = change.revisions ?? {};
   return Object.entries(revisions)
@@ -247,6 +253,7 @@ export function mapChangePatchsets(
         uploader: mapAccount((revInfo as any).uploader),
         created: ((revInfo as any).created ?? "") as any,
         modified_file_paths,
+        commit_message: commitMessages.get(sha) ?? null,
       };
     })
     .sort((a, b) => a.patchset_number - b.patchset_number);

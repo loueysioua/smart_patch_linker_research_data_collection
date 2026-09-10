@@ -553,15 +553,34 @@ function findTriggerInContext(
 /**
  * Canonical key used for cross-format deduplication.
  *
- * For URL and bare-number matches the key is the change number.
  * For Change-ID matches the key is the normalised hash.
+ * For URL and bare-number matches the key is *normally* the change number —
+ * but a bare numeric ID and a Change-Id hash can refer to the exact same
+ * underlying Gerrit change (they are just two identifier schemes for one
+ * change). Without knowledge of that equivalence, a numeric URL match and a
+ * Change-Id match pointing at the same target would get different keys
+ * (`num:12345` vs `change_id:iabc...`) and survive deduplication as two
+ * "different" linkages, even though they resolve to one target commit.
+ *
+ * When an optional `identityMap` (built once from the whole dataset) is
+ * supplied, a numeric match is first resolved to its known Change-Id and
+ * keyed as `change_id:<hash>` — the same key a direct Change-Id match to that
+ * change would produce — so the two collapse into a single canonical entry.
+ * If the number has no known Change-Id in the dataset, it falls back to the
+ * plain `num:<n>` key as before.
+ *
  * The source field is NOT part of the key so the same target mentioned in
  * multiple fields collapses to a single entry (the highest-confidence one is
  * kept because the three detectors are run in descending confidence order).
  */
-function canonicalKey(l: GerritLinkage): string {
+function canonicalKey(l: GerritLinkage, identityMap?: ChangeIdentityMap): string {
   if (l.detectionMethod === "change_id" && l.changeId) {
-    return `change_id:${l.changeId}`;
+    return `change_id:${l.changeId.toLowerCase()}`;
+  }
+  if (l.changeNumber > 0) {
+    const resolvedId = identityMap?.numToId.get(l.changeNumber);
+    if (resolvedId) return `change_id:${resolvedId.toLowerCase()}`;
+    return `num:${l.changeNumber}`;
   }
   return `num:${l.changeNumber}`;
 }
@@ -592,13 +611,34 @@ function confidenceRank(c: ConfidenceLevel): number {
  * detector already drops most hash self-refs; this function adds the numeric
  * guard for URL-embedded change numbers.
  *
- * @param text            Raw source text.
- * @param baseUrl         Base URL of the target Gerrit instance.
- * @param sourceField     Which data field this text came from.
- * @param contextText     Full context message stored on each linkage object.
- * @param ownChangeId     The change's own Change-Id hash (self-refs skipped).
- * @param ownChangeNumber The change's own numeric ID (self-refs skipped).
+ * Cross-identifier self-links: a same-type comparison alone misses the case
+ * where the *own* change is identified in the dataset by one identifier type
+ * (say, its Change-Id) while the scanned text references it via the other
+ * type (say, a numeric review-URL pointing at that very same change). To
+ * catch this, callers may optionally supply `changeIdentityMap` — a
+ * bidirectional lookup built from the full dataset (numeric change number ⇄
+ * Change-Id hash) — so a detected changeNumber can be resolved to a
+ * Change-Id (and compared against `ownChangeId`), and a detected changeId
+ * can be resolved to a changeNumber (and compared against
+ * `ownChangeNumber`), even though the two are expressed as different
+ * identifier types for the same underlying change.
+ *
+ * @param text              Raw source text.
+ * @param baseUrl           Base URL of the target Gerrit instance.
+ * @param sourceField       Which data field this text came from.
+ * @param contextText       Full context message stored on each linkage object.
+ * @param ownChangeId       The change's own Change-Id hash (self-refs skipped).
+ * @param ownChangeNumber   The change's own numeric ID (self-refs skipped).
+ * @param changeIdentityMap Optional bidirectional numeric-ID ⇄ Change-Id
+ *                          lookup used to catch cross-identifier self-refs.
  */
+export interface ChangeIdentityMap {
+  /** numeric change number → Change-Id hash (lower-cased, "i"-prefixed) */
+  numToId: Map<number, string>;
+  /** Change-Id hash (lower-cased) → numeric change number */
+  idToNum: Map<string, number>;
+}
+
 export function extractAllLinkages(
   text: string,
   baseUrl: string,
@@ -606,6 +646,7 @@ export function extractAllLinkages(
   contextText: string,
   ownChangeId: string | null = null,
   ownChangeNumber: number | null = null,
+  changeIdentityMap?: ChangeIdentityMap,
 ): GerritLinkage[] {
   if (!text) return [];
 
@@ -639,7 +680,7 @@ export function extractAllLinkages(
   // Intra-field deduplication by canonical key: keep the highest-confidence entry.
   const best = new Map<string, GerritLinkage>();
   for (const l of combined) {
-    const key = canonicalKey(l);
+    const key = canonicalKey(l, changeIdentityMap);
     const existing = best.get(key);
     if (
       !existing ||
@@ -652,6 +693,7 @@ export function extractAllLinkages(
   // Drop self-links: discard any linkage that resolves back to the change
   // currently being processed, whether identified by numeric ID or Change-ID.
   return [...best.values()].filter((l) => {
+    // Same-type comparisons.
     if (
       ownChangeNumber !== null &&
       l.changeNumber > 0 &&
@@ -664,6 +706,30 @@ export function extractAllLinkages(
       l.changeId.toLowerCase() === normalizedOwnId
     )
       return false;
+
+    // Cross-type comparisons: the linkage and the "own" change may each be
+    // expressed with a different identifier type but still refer to the same
+    // underlying change. Only possible when the caller supplied a dataset
+    // identity map to bridge numeric IDs and Change-Id hashes.
+    if (changeIdentityMap) {
+      // Detected numeric changeNumber → resolve to Change-Id, compare to own Change-Id.
+      if (
+        normalizedOwnId !== null &&
+        l.changeNumber > 0
+      ) {
+        const resolvedId = changeIdentityMap.numToId.get(l.changeNumber);
+        if (resolvedId && resolvedId.toLowerCase() === normalizedOwnId) return false;
+      }
+      // Detected Change-Id → resolve to changeNumber, compare to own changeNumber.
+      if (
+        ownChangeNumber !== null &&
+        l.changeId !== null
+      ) {
+        const resolvedNum = changeIdentityMap.idToNum.get(l.changeId.toLowerCase());
+        if (resolvedNum !== undefined && resolvedNum === ownChangeNumber) return false;
+      }
+    }
+
     return true;
   });
 }
@@ -678,14 +744,25 @@ export function extractAllLinkages(
  * (i.e. commit_message > change_log > comments when the caller passes them in
  * that order).
  *
- * @param linkages  Flat list of linkages from all fields.
+ * Cross-identifier duplicates: two linkages can point at the same underlying
+ * Gerrit change while looking "different" purely because one was matched as
+ * a Change-Id hash and the other as a bare numeric ID / URL. Passing the same
+ * `changeIdentityMap` used elsewhere lets `canonicalKey` resolve both to the
+ * same key so they merge into a single entry instead of producing two
+ * "distinct" linkages (and, downstream, duplicate detail rows) for one target.
+ *
+ * @param linkages         Flat list of linkages from all fields.
+ * @param changeIdentityMap Optional bidirectional numeric-ID ⇄ Change-Id
+ *                          lookup (same one passed to `extractAllLinkages`)
+ *                          used to recognise cross-identifier duplicates.
  */
 export function deduplicateAcrossFields(
   linkages: GerritLinkage[],
+  changeIdentityMap?: ChangeIdentityMap,
 ): GerritLinkage[] {
   const best = new Map<string, GerritLinkage>();
   for (const l of linkages) {
-    const key = canonicalKey(l);
+    const key = canonicalKey(l, changeIdentityMap);
     const existing = best.get(key);
     if (!existing) {
       best.set(key, l);
