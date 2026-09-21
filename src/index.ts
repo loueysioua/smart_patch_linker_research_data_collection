@@ -81,7 +81,7 @@ import type { ChangeInfo } from "@gerritcodereview/typescript-api/rest-api";
 const GERRIT_BASE_URL = "https://review.opendev.org/" as const;
 
 const DEFAULT_OUTPUT = "./output/changes" as const;
-const DEFAULT_QUERY = "is:open" as const;
+const DEFAULT_QUERY = "is:closed" as const;
 const DEFAULT_CONCURRENCY = 6;
 
 // ─── CLI argument parsing ─────────────────────────────────────────────────────
