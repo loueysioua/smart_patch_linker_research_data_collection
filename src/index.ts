@@ -55,7 +55,6 @@ import {
 import {
   mapChangeToMetadata,
   mapChangePatchsets,
-  mapChangeDiffs,
   mapChangeComments,
 } from "./mapper";
 import { ChangeWriter } from "./writer";
@@ -273,7 +272,7 @@ async function enrichPatchsets(
   // rate limiter inside each fetchFiles call — no extra concurrency cap needed
   // here because the outer sliding window already limits change-level tasks).
   const filesPerRevision = new Map<string, RawFilesResponse>();
-  await parallelMap(revShas, revShas.length, async (sha) => {
+  await parallelMap(revShas, 5, async (sha) => {
     let rawFiles: RawFilesResponse = {};
     try {
       rawFiles = await withRetry(() => client.fetchFiles(changeId, sha));
@@ -292,15 +291,21 @@ async function enrichPatchsets(
 async function enrichDiffs(
   client: GerritClient,
   change: ChangeInfo,
-): Promise<PatchsetDiff[]> {
+  onPatchset?: (diff: PatchsetDiff) => void,
+): Promise<PatchsetDiff[] | void> {
   const changeId = Number(change._number);
   const revisions = change.revisions ?? {};
-  const revShas = Object.keys(revisions);
-  const filesPerRevision = new Map<string, RawFilesResponse>();
-  const diffsPerRevision = new Map<string, Map<string, RawDiffInfo>>();
 
-  // Fetch file lists for all revisions in parallel.
-  await parallelMap(revShas, revShas.length, async (sha) => {
+  // Sort shas by patchset number so they are yielded in order
+  const revShas = Object.keys(revisions).sort((a, b) => {
+    const psA = (revisions[a] as any)._number ?? 0;
+    const psB = (revisions[b] as any)._number ?? 0;
+    return psA - psB;
+  });
+
+  const diffs: PatchsetDiff[] = [];
+
+  for (const sha of revShas) {
     let rawFiles: RawFilesResponse = {};
     try {
       rawFiles = await withRetry(() => client.fetchFiles(changeId, sha));
@@ -310,16 +315,12 @@ async function enrichDiffs(
         err,
       );
     }
-    filesPerRevision.set(sha, rawFiles);
-  });
 
-  // For each revision, fetch all file diffs in parallel.
-  await parallelMap(revShas, revShas.length, async (sha) => {
-    const rawFiles = filesPerRevision.get(sha) ?? {};
     const filePaths = Object.keys(rawFiles).filter((p) => p !== "/COMMIT_MSG");
     const diffMap = new Map<string, RawDiffInfo>();
 
-    await parallelMap(filePaths, filePaths.length, async (filePath) => {
+    await parallelMap(filePaths, 10, async (filePath) => {
+      if (rawFiles[filePath]?.binary) return;
       try {
         const diff = await withRetry(() =>
           client.fetchFileDiff(changeId, sha, filePath),
@@ -333,10 +334,54 @@ async function enrichDiffs(
       }
     });
 
-    diffsPerRevision.set(sha, diffMap);
-  });
+    const revInfo = revisions[sha];
+    const psNumber = (revInfo as any)._number ?? 0;
 
-  return mapChangeDiffs(change, diffsPerRevision, filesPerRevision);
+    // We need mapFileDiff from mapper.ts, so we'll import it or use it if already imported
+    // Wait, mapFileDiff is imported in mapper.ts. But index.ts doesn't import mapFileDiff.
+    // Let's check imports.
+    // I can just map it directly.
+    const fileDiffs: import("./types").FileDiff[] = filePaths.map(
+      (filePath) => {
+        const rawDiff = diffMap.get(filePath);
+        const oldPath = rawFiles[filePath]?.old_path ?? null;
+        const isBinary = rawFiles[filePath]?.binary === true;
+
+        if (!rawDiff || isBinary) {
+          return {
+            file_path: filePath,
+            is_binary: isBinary,
+            old_path: oldPath,
+            hunks: [],
+          };
+        }
+
+        return {
+          file_path: filePath,
+          is_binary: false,
+          old_path: oldPath,
+          hunks: rawDiff.content.map((chunk) => ({
+            before: chunk.a != null ? { lines: chunk.a } : null,
+            after: chunk.b != null ? { lines: chunk.b } : null,
+          })),
+        };
+      },
+    );
+
+    const patchsetDiff = {
+      patchset_number: psNumber,
+      commit_sha: sha,
+      file_diffs: fileDiffs,
+    };
+
+    if (onPatchset) {
+      onPatchset(patchsetDiff);
+    } else {
+      diffs.push(patchsetDiff);
+    }
+  }
+
+  if (!onPatchset) return diffs;
 }
 
 async function enrichComments(
@@ -723,13 +768,21 @@ async function main(): Promise<void> {
           `[index] [${activeMode}] Enriching [${++enriched}]${tag} ${label}`,
         );
 
-        let result: unknown;
+        let result: unknown = null;
         if (activeMode === "metadata") {
           result = await enrichMetadata(client, change);
         } else if (activeMode === "patchsets") {
           result = await enrichPatchsets(client, change);
         } else if (activeMode === "diffs") {
-          result = await enrichDiffs(client, change);
+          const stream = writer.createArrayStream(num, activeMode);
+          try {
+            await enrichDiffs(client, change, stream.writeItem);
+            stream.close();
+            result = null; // Do not call writer.write for diffs
+          } catch (e) {
+            stream.abort();
+            throw e;
+          }
         } else {
           result = await enrichComments(client, change);
         }
@@ -738,7 +791,9 @@ async function main(): Promise<void> {
       });
 
       await runWithSlidingWindow(tasks, concurrency, ({ num, result }) => {
-        writer.write(num, activeMode, result);
+        if (result !== null) {
+          writer.write(num, activeMode, result);
+        }
       });
     };
 

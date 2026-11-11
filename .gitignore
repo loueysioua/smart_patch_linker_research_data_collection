@@ -34,4 +34,6 @@ coverage/
 *.swo
 
 output/
-reports
+reports/**/*.db
+reports/**/*.json
+reports/**/*.csv
